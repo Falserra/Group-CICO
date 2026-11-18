@@ -1,19 +1,46 @@
-// Domain model for CiCo (see Master File §5.2 class diagram).
+// Domain model for CiCo (see Master File §5.2 class diagram). These are the shapes the API returns.
 
 export type Role = 'customer' | 'admin';
 export type AccountStatus = 'active' | 'frozen';
 
+// Optional personal details (the user profile). Missing = not filled in yet.
+export type Profile = {
+  email?: string;
+  phone?: string;
+  birthdate?: string; // YYYY-MM-DD
+  address?: string;
+  avatar?: string; // path on the server, e.g. "uploads/avatars/u1_123.jpg" (see fileUrl in api.ts)
+};
+
+/** The signed-in user's own account. Passwords and MPINs never leave the server (NFR-01). */
 export type Account = {
   id: string;
   name: string;
   username: string;
-  password: string;
-  mpin: string; // 6 digits (FR-01)
   role: Role;
+  kind: 'personal' | 'merchant'; // merchants are what counter QR codes should point to
+  createdAt: number;
   balance: number;
   status: AccountStatus;
   verified: boolean; // shows a verified badge to people sending to this account (FR-03)
   biometricEnabled: boolean;
+  profile: Profile;
+};
+
+/** Another account as seen in the public directory (used to look up recipients). */
+export type DirectoryAccount = {
+  id: string;
+  name: string;
+  username: string;
+  role: Role;
+  kind: 'personal' | 'merchant';
+  verified: boolean;
+  status: AccountStatus;
+  reported: boolean; // named in an open suspicious-activity report
+  avatar?: string;
+  // Only sent to administrators:
+  balance?: number;
+  createdAt?: number;
 };
 
 export type TxType = 'send' | 'receive' | 'bill' | 'topup';

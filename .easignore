@@ -1,0 +1,10 @@
+# Files EAS Build should not upload (this replaces .gitignore for EAS, which has most rules commented out).
+node_modules/
+.expo/
+dist/
+web-build/
+android/
+ios/
+*.orig.*
+.DS_Store
+docs/*.pdf

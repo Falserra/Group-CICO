@@ -1,11 +1,17 @@
-// In-memory app state + the operations from the Master File's sequence diagrams.
-// Everything resets on reload; swap these functions for API calls when a backend exists.
-import { createContext, useContext, useRef, useState, type ReactNode } from 'react';
+// App state + the operations from the Master File's sequence diagrams.
+// The MySQL database behind the PHP API (/backend) is the source of truth. After signing in the
+// app downloads one snapshot (GET /sync), shows it, and refreshes it every few seconds, so a
+// payment made on one phone shows up on the other. Every change is a call to the API; the server
+// checks it (balances, ownership, roles) and the app then re-syncs.
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import { AppState } from 'react-native';
 
-import { billers, seedAccounts, seedNotifications, seedPaymentMethods, seedSubscriptions, seedTransactions } from './seed';
+import { api, setApiToken, setUnauthorizedHandler } from './api';
+import { getItem, removeItem, setItem } from './storage';
 import type {
   Account,
   AccountStatus,
+  DirectoryAccount,
   Notification,
   PaymentMethod,
   RiskLevel,
@@ -14,12 +20,13 @@ import type {
   Transaction,
   TxType,
 } from './types';
+import { billers } from './billers';
 import { runRiskAssessment, type RiskResult } from './verification';
 
-const MAX_ATTEMPTS = 5;
-const LOCKOUT_MS = 60_000;
+const TOKEN_KEY = 'cico_session';
+const REMEMBER_KEY = 'cico_remember_username';
+const POLL_MS = 4000;
 
-const uid = (p: string) => p + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export type TxRequest = {
@@ -30,97 +37,200 @@ export type TxRequest = {
   paymentMethodId?: string; // topup
   reference?: string;
   note?: string;
+  qrMerchant?: string; // merchant name printed in a scanned counter QR
 };
 
-type Result = { ok: true } | { ok: false; error: string };
+export type Result = { ok: true } | { ok: false; error: string };
+
+/** Everything GET /sync returns for the signed-in user. */
+type Snapshot = {
+  me: Account;
+  accounts: DirectoryAccount[];
+  transactions: Transaction[];
+  paymentMethods: PaymentMethod[];
+  subscriptions: Subscription[];
+  reports: SuspiciousActivityReport[];
+  notifications: Notification[];
+};
+
+export type ProfileForm = { name: string; email: string; phone: string; birthdate: string; address: string };
+
+type Restored = { username: string | null; outcome: { kind: 'guest' } | { kind: 'ok'; data: Snapshot } | { kind: 'error'; error: string } };
+
+/** At launch: find a saved login and, if there is one, ask the server for that user's data. */
+async function restoreSession(): Promise<Restored> {
+  const [username, saved] = await Promise.all([getItem(REMEMBER_KEY), getItem(TOKEN_KEY)]);
+  if (!saved) return { username, outcome: { kind: 'guest' } };
+  setApiToken(saved);
+  const res = await api<Snapshot & { serverTime: number }>('GET', '/sync');
+  if (res.ok) {
+    const { ok: _ok, serverTime: _t, ...data } = res;
+    return { username, outcome: { kind: 'ok', data } };
+  }
+  setApiToken(null);
+  if (res.status === 401) {
+    removeItem(TOKEN_KEY); // expired, or wiped by a reset: back to the login screen
+    return { username, outcome: { kind: 'guest' } };
+  }
+  return { username, outcome: { kind: 'error', error: res.error } }; // server unreachable: keep the token and let the user retry
+}
 
 function useWalletState() {
-  const [accounts, setAccounts] = useState<Account[]>(seedAccounts);
-  const [transactions, setTransactions] = useState<Transaction[]>(seedTransactions);
-  const [paymentMethods] = useState<PaymentMethod[]>(seedPaymentMethods);
-  const [subscriptions, setSubscriptions] = useState<Subscription[]>(seedSubscriptions);
-  const [reports, setReports] = useState<SuspiciousActivityReport[]>([]);
-  const [notifications, setNotifications] = useState<Notification[]>(seedNotifications);
-  const [userId, setUserId] = useState<string | null>(null);
-  const [lastUserId, setLastUserId] = useState<string | null>(null);
-  const attempts = useRef<Record<string, { count: number; until: number }>>({});
+  const [ready, setReady] = useState(false); // saved session checked
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [offline, setOffline] = useState(false); // a refresh failed while signed in
+  const [snap, setSnap] = useState<Snapshot | null>(null);
+  const [lastMe, setLastMe] = useState<Account | null>(null); // protected screens render once more during logout
+  const [lastRegistered, setLastRegistered] = useState<string | null>(null);
+  const [remembered, setRemembered] = useState<string | null>(null);
 
-  const me = accounts.find((a) => a.id === userId) ?? null;
-  // Protected screens may render once more during logout; give them the last account.
-  const lastMe = accounts.find((a) => a.id === (userId ?? lastUserId)) ?? null;
+  const seq = useRef(0); // ignore sync replies that arrive out of order
+  const lastJson = useRef(''); // skip re-rendering when nothing changed
+  const signedIn = snap !== null;
+
+  const apply = (s: Snapshot) => {
+    setSnap(s);
+    setLastMe(s.me);
+  };
+
+  /** Download the latest snapshot. Returns false when it could not (offline, or session rejected). */
+  async function refresh(): Promise<boolean> {
+    const mine = ++seq.current;
+    const res = await api<Snapshot & { serverTime: number }>('GET', '/sync');
+    if (mine !== seq.current) return res.ok; // a newer refresh (or a logout) superseded this one
+    if (!res.ok) {
+      if (res.status === 0) setOffline(true);
+      return false;
+    }
+    setOffline(false);
+    const { ok: _ok, serverTime: _t, ...data } = res;
+    const json = JSON.stringify(data);
+    if (json !== lastJson.current) {
+      lastJson.current = json;
+      apply(data);
+    }
+    return true;
+  }
+
+  function clearSession() {
+    seq.current++;
+    setApiToken(null);
+    removeItem(TOKEN_KEY);
+    lastJson.current = '';
+    setSnap(null);
+    setOffline(false);
+  }
+
+  // ---- Launch: restore a saved session ----
+  const boot = () =>
+    restoreSession().then(({ username, outcome }) => {
+      setRemembered(username);
+      if (outcome.kind === 'error') return setLoadError(outcome.error);
+      if (outcome.kind === 'ok') {
+        lastJson.current = JSON.stringify(outcome.data);
+        apply(outcome.data);
+      }
+      setReady(true);
+    });
+  useEffect(() => {
+    setUnauthorizedHandler(clearSession);
+    boot();
+    return () => setUnauthorizedHandler(null);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps -- once at launch
+  const retryLoad = () => {
+    setLoadError(null);
+    boot();
+  };
+
+  // ---- Keep the snapshot fresh while signed in ----
+  useEffect(() => {
+    if (!signedIn) return;
+    const tick = () => AppState.currentState === 'active' && refresh();
+    const timer = setInterval(tick, POLL_MS);
+    const sub = AppState.addEventListener('change', (state) => state === 'active' && refresh());
+    return () => {
+      clearInterval(timer);
+      sub.remove();
+    };
+  }, [signedIn]); // eslint-disable-line react-hooks/exhaustive-deps -- refresh only uses refs and setters
+
+  // Run a call, then re-sync so every screen shows what the server now holds.
+  async function act<T = object>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown) {
+    const res = await api<T>(method, path, body);
+    if (res.ok) await refresh();
+    return res;
+  }
+  const toResult = (res: { ok: true } | { ok: false; error: string }): Result => (res.ok ? { ok: true } : { ok: false, error: res.error });
+
+  const me = snap?.me ?? null;
+  const accounts = snap?.accounts ?? [];
+  const transactionsAll = snap?.transactions ?? [];
+  const reports = snap?.reports ?? [];
+  const notificationsAll = snap?.notifications ?? [];
+  const paymentMethods = snap?.paymentMethods ?? [];
+
   const accountById = (id: string) => accounts.find((a) => a.id === id);
   const accountByUsername = (u: string) => accounts.find((a) => a.username === u.trim().toLowerCase().replace(/^@/, ''));
 
-  const notify = (accountId: string, message: string, kind: Notification['kind'] = 'info') =>
-    setNotifications((ns) => [{ id: uid('n'), accountId, message, kind, timestamp: Date.now(), read: false }, ...ns]);
-
-  const patchAccount = (id: string, patch: Partial<Account>) =>
-    setAccounts((as) => as.map((a) => (a.id === id ? { ...a, ...patch } : a)));
-
-  // ---- Lockout after repeated failures (TC-01) ----
-  const lockedFor = (username: string) => {
-    const a = attempts.current[username];
-    return a && a.until > Date.now() ? Math.ceil((a.until - Date.now()) / 1000) : 0;
-  };
-  const fail = (username: string) => {
-    const a = attempts.current[username] ?? { count: 0, until: 0 };
-    a.count += 1;
-    if (a.count >= MAX_ATTEMPTS) {
-      a.until = Date.now() + LOCKOUT_MS;
-      a.count = 0;
-    }
-    attempts.current[username] = a;
-    return MAX_ATTEMPTS - a.count;
-  };
-  const clearAttempts = (username: string) => delete attempts.current[username];
-
-  // ---- Authentication (Figure 10) ----
-  function validateCredentials(username: string, password: string): { ok: true; account: Account } | { ok: false; error: string } {
-    const u = username.trim().toLowerCase();
-    const secs = lockedFor(u);
-    if (secs) return { ok: false, error: `Too many failed attempts. Try again in ${secs}s.` };
-    const account = accounts.find((a) => a.username === u && a.password === password);
-    if (!account) {
-      const left = accounts.some((a) => a.username === u) ? fail(u) : MAX_ATTEMPTS;
-      return { ok: false, error: left < MAX_ATTEMPTS && left > 0 ? `Invalid username or password. ${left} attempt(s) left.` : 'Invalid username or password.' };
-    }
-    return { ok: true, account };
+  // ---- Authentication (Figure 10): password -> MPIN or biometric ----
+  async function validateCredentials(username: string, password: string) {
+    const res = await api<{ pendingToken: string; name: string; biometricEnabled: boolean }>('POST', '/auth/login', { username, password });
+    return res.ok ? ({ ok: true, pending: { token: res.pendingToken, name: res.name, biometricEnabled: res.biometricEnabled } } as const) : ({ ok: false, error: res.error } as const);
   }
 
-  function verifySecondFactor(account: Account, mpin: string): Result {
-    const secs = lockedFor(account.username);
-    if (secs) return { ok: false, error: `Too many failed attempts. Try again in ${secs}s.` };
-    if (mpin !== account.mpin) {
-      const left = fail(account.username);
-      return { ok: false, error: lockedFor(account.username) ? 'Too many failed attempts. Login locked for 60s.' : `Incorrect MPIN. ${left} attempt(s) left.` };
+  async function finishLogin(pendingToken: string, factor: { mpin: string } | { biometric: true }): Promise<Result> {
+    const res = await api<{ token: string }>('POST', '/auth/verify', { pendingToken, ...factor });
+    if (!res.ok) return { ok: false, error: res.error };
+    setApiToken(res.token);
+    await setItem(TOKEN_KEY, res.token);
+    if (!(await refresh())) {
+      clearSession();
+      return { ok: false, error: "You're signed in, but your data could not be loaded. Check the connection and try again." };
     }
-    clearAttempts(account.username);
     return { ok: true };
   }
 
-  const login = (account: Account) => {
-    clearAttempts(account.username);
-    setUserId(account.id);
-    setLastUserId(account.id);
-  };
-  const logout = () => setUserId(null);
+  async function logout() {
+    api('POST', '/auth/logout'); // best effort: the token also expires on its own
+    clearSession();
+  }
 
-  function register(f: { name: string; username: string; password: string; mpin: string }): Result {
-    const username = f.username.trim().toLowerCase();
-    if (accounts.some((a) => a.username === username)) return { ok: false, error: 'Username taken. Pick a different username.' };
-    const id = uid('u');
-    setAccounts((as) => [
-      ...as,
-      { id, name: f.name.trim(), username, password: f.password, mpin: f.mpin, role: 'customer', balance: 0, status: 'active', verified: false, biometricEnabled: false },
-    ]);
-    setNotifications((ns) => [{ id: uid('n'), accountId: id, message: 'Welcome to CiCo! Top up from a linked bank or card to get started.', kind: 'info', timestamp: Date.now(), read: false }, ...ns]);
+  // "Remember me" on the login screen keeps the username between launches.
+  const setRememberedUsername = (u: string | null) => {
+    setRemembered(u);
+    if (u) setItem(REMEMBER_KEY, u);
+    else removeItem(REMEMBER_KEY);
+  };
+
+  async function register(f: { name: string; username: string; password: string; mpin: string; email?: string; phone?: string }): Promise<Result> {
+    const res = await api<{ username: string }>('POST', '/auth/register', f);
+    if (!res.ok) return { ok: false, error: res.error };
+    setLastRegistered(res.username);
     return { ok: true };
   }
 
-  const setBiometric = (enabled: boolean) => me && patchAccount(me.id, { biometricEnabled: enabled });
+  // ---- Profile ----
+  async function updateProfile(f: ProfileForm): Promise<Result> {
+    return toResult(await act('PUT', '/me/profile', f));
+  }
+  /** base64 = the picked photo as base64 (no data: prefix); null removes the photo. */
+  async function setAvatar(base64: string | null): Promise<Result> {
+    return toResult(await act('POST', '/me/avatar', { image: base64 }));
+  }
+  async function changePassword(current: string, next: string): Promise<Result> {
+    return toResult(await act('POST', '/me/password', { current, next }));
+  }
+  async function changeMpin(current: string, next: string): Promise<Result> {
+    return toResult(await act('POST', '/me/mpin', { current, next }));
+  }
+  async function setBiometric(enabled: boolean): Promise<Result> {
+    return toResult(await act('POST', '/me/biometric', { enabled }));
+  }
 
   // ---- Money movement + verification (Figure 5 / Figure 11) ----
-  function verifyTransaction(req: TxRequest): RiskResult & { recipientName?: string; recipientVerified?: boolean } {
+  // The risk check runs on the phone against the public directory, so the warning appears instantly;
+  // the server independently enforces balances, frozen accounts and ownership when money moves.
+  function verifyTransaction(req: TxRequest): RiskResult & { recipientName?: string; recipientVerified?: boolean; recipientIsMerchant?: boolean } {
     if (!me) return { level: 'red', reasons: ['Not logged in'] };
     if (req.type === 'send') {
       const r = req.recipientUsername ? accountByUsername(req.recipientUsername) : undefined;
@@ -132,11 +242,14 @@ function useWalletState() {
         recipientKnown: !!valid,
         recipientVerified: !!r?.verified,
         recipientFrozen: r?.status === 'frozen',
-        recipientReported: !!r && reports.some((x) => x.description.toLowerCase().includes('@' + r.username) && x.status !== 'dismissed'),
-        firstTimeRecipient: !!r && !transactions.some((t) => t.accountId === me.id && t.type === 'send' && t.counterparty === r.name && t.status === 'completed'),
+        recipientReported: !!r?.reported,
+        firstTimeRecipient: !!r && !transactionsAll.some((t) => t.accountId === me.id && t.type === 'send' && t.counterparty === r.name && t.status === 'completed'),
         note: req.note,
+        qrMerchantClaim: req.qrMerchant,
+        recipientName: r?.name,
+        recipientIsMerchant: r?.kind === 'merchant',
       });
-      return { ...res, recipientName: valid ? r.name : undefined, recipientVerified: r?.verified };
+      return { ...res, recipientName: valid ? r.name : undefined, recipientVerified: r?.verified, recipientIsMerchant: r?.kind === 'merchant' };
     }
     if (req.type === 'bill') {
       const b = billers.find((x) => x.id === req.billerId);
@@ -148,127 +261,118 @@ function useWalletState() {
     return { ...res, recipientName: pm ? `${pm.label} ${pm.accountNumber}` : undefined, recipientVerified: true };
   }
 
-  // processPayment → PaymentGateway → BankPaymentNetwork (simulated)
+  // processPayment -> PaymentGateway -> BankPaymentNetwork
   async function processTransaction(req: TxRequest, risk: RiskLevel): Promise<Result & { transactionId?: string }> {
     if (!me) return { ok: false, error: 'Not logged in.' };
-    await wait(700);
-    const id = uid('t');
-    const base = { id, accountId: me.id, type: req.type, amount: req.amount, reference: req.reference, note: req.note, timestamp: Date.now(), risk };
-
-    const failWith = (counterparty: string, error: string): Result => {
-      setTransactions((ts) => [{ ...base, counterparty, status: 'failed' }, ...ts]);
-      return { ok: false, error };
-    };
-
-    if (me.status === 'frozen') return { ok: false, error: 'Your account is frozen. Contact support to unlock it.' };
-    if (req.amount <= 0) return { ok: false, error: 'Enter an amount greater than zero.' };
-    if (req.type !== 'topup' && req.amount > me.balance) return failWith(req.recipientUsername ?? 'Biller', 'Insufficient balance.');
-
-    if (req.type === 'send') {
-      const r = accountByUsername(req.recipientUsername ?? '');
-      if (!r || r.role !== 'customer' || r.id === me.id) return { ok: false, error: 'Recipient not found.' };
-      if (r.status === 'frozen') return failWith(r.name, 'The recipient account cannot receive funds right now.');
-      setAccounts((as) => as.map((a) => (a.id === me.id ? { ...a, balance: a.balance - req.amount } : a.id === r.id ? { ...a, balance: a.balance + req.amount } : a)));
-      setTransactions((ts) => [
-        { ...base, counterparty: r.name, status: 'completed' },
-        { ...base, id: uid('t'), accountId: r.id, type: 'receive', counterparty: me.name, status: 'completed' },
-        ...ts,
-      ]);
-      notify(me.id, `You sent ₱${req.amount.toFixed(2)} to ${r.name}.`, 'success');
-      notify(r.id, `You received ₱${req.amount.toFixed(2)} from ${me.name}.`, 'success');
-      return { ok: true, transactionId: id };
-    }
-    if (req.type === 'bill') {
-      const b = billers.find((x) => x.id === req.billerId);
-      if (!b) return { ok: false, error: 'Biller not found.' };
-      patchAccount(me.id, { balance: me.balance - req.amount });
-      setTransactions((ts) => [{ ...base, counterparty: b.name, status: 'completed' }, ...ts]);
-      notify(me.id, `Paid ₱${req.amount.toFixed(2)} to ${b.name}.`, 'success');
-      return { ok: true, transactionId: id };
-    }
-    const pm = paymentMethods.find((p) => p.id === req.paymentMethodId);
-    if (!pm) return { ok: false, error: 'Choose a funding source.' };
-    patchAccount(me.id, { balance: me.balance + req.amount });
-    setTransactions((ts) => [{ ...base, counterparty: pm.label, reference: pm.accountNumber, status: 'completed' }, ...ts]);
-    notify(me.id, `Topped up ₱${req.amount.toFixed(2)} from ${pm.label}.`, 'success');
-    return { ok: true, transactionId: id };
+    await wait(700); // gateway round trip shown by the "Processing…" step
+    const res = await act<{ transactionId: string }>('POST', '/transactions', {
+      type: req.type,
+      amount: req.amount,
+      recipientUsername: req.recipientUsername,
+      billerId: req.billerId,
+      paymentMethodId: req.paymentMethodId,
+      reference: req.reference,
+      note: req.note,
+      risk,
+    });
+    if (!res.ok) await refresh(); // a failed attempt is still recorded in the history
+    return res.ok ? { ok: true, transactionId: res.transactionId } : { ok: false, error: res.error };
   }
 
-  // User declined a flagged transaction → cancel it and report to admin
+  // User declined a flagged transaction -> cancel it and (optionally) report to admin
   function cancelTransaction(req: TxRequest, risk: RiskLevel, counterparty: string, reasons: string[], report: boolean) {
     if (!me) return;
-    const id = uid('t');
-    setTransactions((ts) => [{ id, accountId: me.id, type: req.type, amount: req.amount, counterparty, reference: req.reference, note: req.note, timestamp: Date.now(), status: 'cancelled', risk }, ...ts]);
-    if (report) {
-      const target = req.recipientUsername ? ` to @${req.recipientUsername.replace(/^@/, '').toLowerCase()}` : '';
-      submitReport({ transactionId: id, description: `Auto-report: user cancelled a flagged ${req.type}${target} (₱${req.amount.toFixed(2)}). Flags: ${reasons.join('; ')}` });
-    }
+    act('POST', '/transactions/cancel', {
+      type: req.type,
+      amount: req.amount,
+      counterparty,
+      reference: req.reference,
+      note: req.note,
+      recipientUsername: req.recipientUsername,
+      risk,
+      reasons,
+      report,
+    });
   }
 
   // ---- Subscription Hub (Figure 8 / Figure 13) ----
   async function setSubscriptionStatus(id: string, status: Subscription['status']): Promise<Result> {
     await wait(500); // revokeAccessToken() at ExternalMerchantAPI
-    const s = subscriptions.find((x) => x.id === id);
-    if (!s || !me) return { ok: false, error: 'Unable to revoke access' };
-    setSubscriptions((ss) => ss.map((x) => (x.id === id ? { ...x, status } : x)));
-    const verb = status === 'unbound' ? 'unbound and its access token revoked' : status === 'blocked' ? 'blocked from auto-deducting' : 'allowed to auto-deduct again';
-    notify(me.id, `${s.merchant} was ${verb}.`, status === 'active' ? 'info' : 'security');
-    return { ok: true };
+    return toResult(await act('POST', `/subscriptions/${id}/status`, { status }));
   }
 
   // ---- Reports, emergency freeze, admin (Figure 9 / Figure 14) ----
-  function submitReport(r: { description: string; transactionId?: string; emergency?: boolean }) {
-    if (!me) return;
-    const report: SuspiciousActivityReport = { id: uid('r'), accountId: me.id, transactionId: r.transactionId, description: r.description, emergency: !!r.emergency, timestamp: Date.now(), status: 'pending' };
-    setReports((rs) => [report, ...rs]);
-    accounts.filter((a) => a.role === 'admin').forEach((a) => notify(a.id, `New ${r.emergency ? 'EMERGENCY ' : ''}report from ${me.name}.`, 'security'));
-    return report;
+  async function submitReport(r: { description: string; transactionId?: string }): Promise<Result> {
+    return toResult(await act('POST', '/reports', r));
   }
 
-  async function emergencyFreeze(): Promise<Result> {
-    if (!me) return { ok: false, error: 'Not logged in.' };
-    patchAccount(me.id, { status: 'frozen' });
-    submitReport({ emergency: true, description: 'User activated 1-tap emergency freeze. All outgoing funds locked pending review.' });
-    notify(me.id, 'Your wallet is frozen. No money can leave your account until the Security Team unlocks it.', 'security');
-    return { ok: true };
+  // FR-05 (revised): freeze applied within 3 s. The server freezes the account and files the ticket
+  // in a single database transaction; the measured time-to-lock is the full round trip.
+  async function emergencyFreeze(): Promise<Result & { ms: number }> {
+    const t0 = performance.now();
+    if (!me) return { ok: false, error: 'Not logged in.', ms: 0 };
+    const res = await api('POST', '/me/freeze');
+    const ms = performance.now() - t0;
+    if (!res.ok) return { ok: false, error: res.error, ms };
+    await refresh();
+    return { ok: true, ms };
   }
 
   function reviewReport(reportId: string, decision: 'freeze' | 'dismiss') {
-    const r = reports.find((x) => x.id === reportId);
-    if (!r) return;
-    setReports((rs) => rs.map((x) => (x.id === reportId ? { ...x, status: decision === 'freeze' ? 'resolved-frozen' : 'dismissed' } : x)));
-    if (decision === 'freeze') {
-      patchAccount(r.accountId, { status: 'frozen' });
-      notify(r.accountId, 'Your report was confirmed. Your account has been frozen to protect your funds.', 'security');
-    } else {
-      notify(r.accountId, 'Your report was reviewed by the Security Team and closed.', 'info');
-    }
+    act('POST', `/admin/reports/${reportId}/review`, { decision });
   }
 
   function setAccountStatus(accountId: string, status: AccountStatus) {
-    patchAccount(accountId, { status });
-    notify(accountId, status === 'frozen' ? 'Your account was frozen by the Security Team.' : 'Your account was unlocked by the Security Team.', 'security');
+    // Only the Security Team can lock or unlock an account.
+    if (me?.role === 'admin') act('POST', `/admin/accounts/${accountId}/status`, { status });
   }
 
-  const markAllRead = () => me && setNotifications((ns) => ns.map((n) => (n.accountId === me.id ? { ...n, read: true } : n)));
+  const markAllRead = () => {
+    if (!me) return;
+    setSnap((s) => s && { ...s, notifications: s.notifications.map((n) => (n.accountId === me.id ? { ...n, read: true } : n)) });
+    api('POST', '/notifications/read', {});
+  };
+  const markRead = (id: string) => {
+    setSnap((s) => s && { ...s, notifications: s.notifications.map((n) => (n.id === id ? { ...n, read: true } : n)) });
+    api('POST', '/notifications/read', { id });
+  };
+
+  // ---- Linked bank accounts and cards (used by Top up) ----
+  async function linkAccount(f: { label: string; type: 'bank' | 'card'; number: string }): Promise<Result> {
+    return toResult(await act('POST', '/payment-methods', f));
+  }
+  async function unlinkAccount(id: string): Promise<Result> {
+    return toResult(await act('DELETE', `/payment-methods/${id}`));
+  }
 
   return {
+    ready,
+    loadError,
+    retryLoad,
+    offline,
+    refresh,
     me,
     lastMe,
+    lastRegistered,
     accounts,
     accountById,
     accountByUsername,
-    transactions: me ? transactions.filter((t) => t.accountId === me.id) : [],
-    allTransactions: transactions,
-    paymentMethods: me ? paymentMethods.filter((p) => p.accountId === me.id) : [],
-    subscriptions: me ? subscriptions.filter((s) => s.accountId === me.id) : [],
+    transactions: me ? transactionsAll.filter((t) => t.accountId === me.id) : [],
+    allTransactions: transactionsAll,
+    paymentMethods: me ? paymentMethods : [],
+    subscriptions: me ? (snap?.subscriptions ?? []) : [],
     reports,
-    notifications: me ? notifications.filter((n) => n.accountId === me.id) : [],
+    notifications: me ? notificationsAll.filter((n) => n.accountId === me.id) : [],
     validateCredentials,
-    verifySecondFactor,
-    login,
+    finishLogin,
     logout,
+    rememberedUsername: remembered,
+    setRememberedUsername,
     register,
+    updateProfile,
+    setAvatar,
+    changePassword,
+    changeMpin,
     setBiometric,
     verifyTransaction,
     processTransaction,
@@ -279,6 +383,9 @@ function useWalletState() {
     reviewReport,
     setAccountStatus,
     markAllRead,
+    markRead,
+    linkAccount,
+    unlinkAccount,
   };
 }
 

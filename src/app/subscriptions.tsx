@@ -1,15 +1,16 @@
 // Subscription Hub (FR-04, Figure 8 / Figure 13): view, block or unbind third-party auto-deductions.
 import { useState } from 'react';
-import { Alert, Text, View } from 'react-native';
+import { Text, View } from 'react-native';
 
+import { Alert } from '@/lib/alert';
 import { Btn, C, Card, Empty, H2, Muted, Screen, formatDate, peso } from '@/components/wallet-ui';
 import type { Subscription } from '@/lib/types';
 import { useWallet } from '@/lib/wallet-store';
 
 const STATUS_COPY: Record<Subscription['status'], { label: string; color: string; bg: string }> = {
-  active: { label: 'Auto-deducting', color: '#0E7C4A', bg: '#DDF5E8' },
-  blocked: { label: 'Blocked', color: '#8A5A00', bg: '#FFF1CC' },
-  unbound: { label: 'Unbound', color: '#6B7C8F', bg: '#E6EBF0' },
+  active: { label: 'Auto-deducting', color: '#0E9F6E', bg: '#E3F7EF' },
+  blocked: { label: 'Blocked', color: '#A15C07', bg: '#FFF4D6' },
+  unbound: { label: 'Unbound', color: '#64748B', bg: '#E2E8F0' },
 };
 
 export default function SubscriptionsScreen() {
@@ -40,13 +41,13 @@ export default function SubscriptionsScreen() {
 
   return (
     <Screen>
-      <Card style={{ backgroundColor: C.ink }}>
-        <Text style={{ color: '#BFD3E6' }}>Estimated auto-deductions per month</Text>
+      <Card style={{ backgroundColor: C.primary }}>
+        <Text style={{ color: '#CFE0F7' }}>Estimated auto-deductions per month</Text>
         <Text style={{ color: '#fff', fontSize: 28, fontWeight: '800', marginTop: 4 }}>{peso(monthly)}</Text>
-        <Text style={{ color: '#BFD3E6', marginTop: 4 }}>{subscriptions.filter((x) => x.status === 'active').length} app(s) can charge your wallet</Text>
+        <Text style={{ color: '#CFE0F7', marginTop: 4 }}>{subscriptions.filter((x) => x.status === 'active').length} app(s) can charge your wallet</Text>
       </Card>
 
-      {linked.length === 0 && <Empty text="No linked apps can charge your wallet." />}
+      {linked.length === 0 && <Empty icon="repeat-outline" text="No apps can charge your wallet. Apps you allow to auto-deduct will appear here." />}
       {linked.map((sub) => {
         const st = STATUS_COPY[sub.status];
         return (

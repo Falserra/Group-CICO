@@ -1,10 +1,15 @@
 import { useEffect } from 'react';
 import { Text, View } from 'react-native';
 
-import { C, Card, Empty, Muted, Screen, formatDate } from '@/components/wallet-ui';
+import { C, Empty, IconBubble, Screen, formatDate, s, type IconName } from '@/components/wallet-ui';
 import { useWallet } from '@/lib/wallet-store';
 
-const ICON = { info: 'ℹ️', success: '✅', warning: '⚠️', security: '🛡️' } as const;
+const LOOK: Record<'info' | 'success' | 'warning' | 'security', { icon: IconName; color: string; bg: string }> = {
+  info: { icon: 'information-circle', color: C.primary, bg: C.primarySoft },
+  success: { icon: 'checkmark-circle', color: C.success, bg: C.successBg },
+  warning: { icon: 'warning', color: C.warn, bg: C.warnBg },
+  security: { icon: 'shield-checkmark', color: C.primary, bg: C.primarySoft },
+};
 
 export default function NotificationsScreen() {
   const { notifications, markAllRead } = useWallet();
@@ -16,18 +21,21 @@ export default function NotificationsScreen() {
   return (
     <Screen>
       {notifications.length === 0 ? (
-        <Empty text="You're all caught up." />
+        <Empty icon="notifications-off-outline" text="You're all caught up." />
       ) : (
-        notifications.map((n) => (
-          <Card key={n.id} style={{ flexDirection: 'row', gap: 12 }}>
-            <Text style={{ fontSize: 20 }}>{ICON[n.kind]}</Text>
-            <View style={{ flex: 1 }}>
-              <Text style={{ color: C.ink, fontWeight: n.read ? '400' : '700' }}>{n.message}</Text>
-              <Muted>{formatDate(n.timestamp)}</Muted>
+        notifications.map((n) => {
+          const look = LOOK[n.kind];
+          return (
+            <View key={n.id} style={s.row}>
+              <IconBubble name={look.icon} color={look.color} bg={look.bg} />
+              <View style={{ flex: 1 }}>
+                <Text style={{ color: C.ink, fontWeight: n.read ? '400' : '700', lineHeight: 20 }}>{n.message}</Text>
+                <Text style={s.rowS}>{formatDate(n.timestamp)}</Text>
+              </View>
+              {!n.read && <View style={{ width: 9, height: 9, borderRadius: 5, backgroundColor: C.accent }} />}
             </View>
-            {!n.read && <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: C.teal, marginTop: 6 }} />}
-          </Card>
-        ))
+          );
+        })
       )}
     </Screen>
   );

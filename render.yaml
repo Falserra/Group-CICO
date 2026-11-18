@@ -1,0 +1,26 @@
+# Render Blueprint: deploys the CiCo API (backend/) as a free Docker web service.
+# Secrets are not stored here: Render asks for them the first time (sync: false).
+# Step-by-step: docs/DEPLOY.md
+services:
+  - type: web
+    name: cico-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /index.php/health
+    envVars:
+      - key: CICO_DB_HOST
+        sync: false
+      - key: CICO_DB_PORT
+        value: "4000"
+      - key: CICO_DB_NAME
+        value: cico
+      - key: CICO_DB_USER
+        sync: false
+      - key: CICO_DB_PASS
+        sync: false
+      - key: CICO_DB_SSL
+        value: "1"
+      - key: CICO_DEBUG
+        value: "0"

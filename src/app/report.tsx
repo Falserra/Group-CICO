@@ -1,8 +1,9 @@
 // Report Suspicious Activity (Figure 9 / Figure 14).
 import { router, useLocalSearchParams } from 'expo-router';
 import { useState } from 'react';
-import { Alert, Text, View } from 'react-native';
+import { Text, View } from 'react-native';
 
+import { Alert } from '@/lib/alert';
 import { Btn, C, Card, Chip, H2, Input, Muted, Screen, formatDate, peso } from '@/components/wallet-ui';
 import { useWallet } from '@/lib/wallet-store';
 
@@ -16,10 +17,15 @@ export default function ReportScreen() {
   const [details, setDetails] = useState('');
   const mine = reports.filter((r) => r.accountId === me?.id);
 
-  const submit = () => {
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
     if (!reason) return Alert.alert('Choose a reason', 'Tell us what happened.');
     const txText = tx ? ` [${tx.type} ${peso(tx.amount)} – ${tx.counterparty}, ${formatDate(tx.timestamp)}]` : '';
-    submitReport({ transactionId: tx?.id, description: `${reason}${txText}${details.trim() ? ': ' + details.trim() : ''}` });
+    setBusy(true);
+    const res = await submitReport({ transactionId: tx?.id, description: `${reason}${txText}${details.trim() ? ': ' + details.trim() : ''}` });
+    setBusy(false);
+    if (!res.ok) return Alert.alert('Report not sent', res.error);
     Alert.alert('Report sent', 'Your timestamped ticket is in the Security Team queue. You will be notified once it is reviewed.');
     router.back();
   };
@@ -52,7 +58,7 @@ export default function ReportScreen() {
           onChangeText={setDetails}
           style={{ minHeight: 90, textAlignVertical: 'top' }}
         />
-        <Btn label="Submit report" onPress={submit} />
+        <Btn label="Submit report" onPress={submit} loading={busy} />
       </Card>
       <Muted>Need to stop money leaving right now? Use the red Emergency freeze button on your dashboard.</Muted>
 

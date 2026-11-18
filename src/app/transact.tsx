@@ -4,10 +4,11 @@
 import { usePreventScreenCapture } from 'expo-screen-capture';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, Pressable, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, Text, View } from 'react-native';
 
-import { Btn, C, Card, Chip, H2, Input, Muted, RiskIndicator, Screen, VerifiedBadge, peso, s } from '@/components/wallet-ui';
-import { billers } from '@/lib/seed';
+import { Alert } from '@/lib/alert';
+import { Btn, C, Card, Chip, H2, IconBubble, Input, Muted, RiskIndicator, Screen, VerifiedBadge, peso, s } from '@/components/wallet-ui';
+import { billers } from '@/lib/billers';
 import { detectScreenSharing } from '@/lib/security-layer';
 import type { RiskLevel, TxType } from '@/lib/types';
 import { useMe, useWallet, type TxRequest } from '@/lib/wallet-store';
@@ -19,16 +20,17 @@ const TITLES: Record<MoneyType, string> = { send: 'Send money', bill: 'Pay bills
 const MAX_OTP_TRIES = 3;
 
 export default function TransactScreen() {
-  const params = useLocalSearchParams<{ type?: string }>();
+  // to / merchant / amount arrive pre-filled from a scanned counter QR (qr.tsx)
+  const params = useLocalSearchParams<{ type?: string; to?: string; merchant?: string; amount?: string }>();
   const me = useMe();
   const { paymentMethods, accountByUsername, verifyTransaction, processTransaction, cancelTransaction } = useWallet();
 
   const [type, setType] = useState<MoneyType>(params.type === 'bill' || params.type === 'topup' ? params.type : 'send');
-  const [recipient, setRecipient] = useState('');
+  const [recipient, setRecipient] = useState(params.to ?? '');
   const [billerId, setBillerId] = useState(billers[0].id);
   const [reference, setReference] = useState('');
   const [methodId, setMethodId] = useState(paymentMethods[0]?.id ?? '');
-  const [amountText, setAmountText] = useState('');
+  const [amountText, setAmountText] = useState(params.amount ?? '');
   const [note, setNote] = useState('');
   const [step, setStep] = useState<Step>('form');
   const [error, setError] = useState('');
@@ -43,6 +45,8 @@ export default function TransactScreen() {
     paymentMethodId: type === 'topup' ? methodId : undefined,
     reference: type === 'bill' ? reference.trim() : undefined,
     note: type === 'send' ? note.trim() || undefined : undefined,
+    // The QR's merchant claim only applies while paying the account the QR pointed to.
+    qrMerchant: type === 'send' && params.merchant && params.to && recipient.trim().toLowerCase() === params.to.toLowerCase() ? params.merchant : undefined,
   };
   // Synchronous rule check on every render – well under NFR-02's 2s budget.
   const check = verifyTransaction(req);
@@ -102,6 +106,7 @@ export default function TransactScreen() {
             ))}
           </View>
           <Card>
+            {req.qrMerchant && <Muted style={{ marginBottom: 8 }}>From QR code: “{req.qrMerchant}”</Muted>}
             {type === 'send' && (
               <>
                 <Input label="Recipient's CiCo username" placeholder="e.g. juan" autoCapitalize="none" autoCorrect={false} value={recipient} onChangeText={setRecipient} />
@@ -134,7 +139,7 @@ export default function TransactScreen() {
                 <Text style={s.label}>Funding source</Text>
                 <View style={{ flexDirection: 'row', flexWrap: 'wrap', marginBottom: 6 }}>
                   {paymentMethods.length === 0 ? (
-                    <Muted>No linked bank or card yet.</Muted>
+                    <Btn label="Link a bank account or card" variant="soft" icon="link-outline" onPress={() => router.push('/link-account')} />
                   ) : (
                     paymentMethods.map((p) => <Chip key={p.id} label={`${p.label} ${p.accountNumber}`} active={methodId === p.id} onPress={() => setMethodId(p.id)} />)
                   )}
@@ -144,7 +149,7 @@ export default function TransactScreen() {
 
             <Input label="Amount (₱)" placeholder="0.00" keyboardType="decimal-pad" value={amountText} onChangeText={setAmountText} />
             {type === 'send' && <Input label="Message (optional)" placeholder="What's it for?" value={note} onChangeText={setNote} />}
-            {type !== 'topup' && <Muted style={{ marginBottom: 8 }}>Available: {peso(me.balance)}</Muted>}
+            {type !== 'topup' && <Muted style={{ marginBottom: 8 }}>Available balance: {peso(me.balance)}</Muted>}
             <Btn label="Continue" onPress={toReview} />
           </Card>
         </>
@@ -173,7 +178,7 @@ export default function TransactScreen() {
             <Btn label="Confirm" onPress={() => setStep('otp')} />
           ) : (
             <>
-              <Card style={{ backgroundColor: '#FFF7E6' }}>
+              <Card style={{ backgroundColor: C.warnBg }}>
                 <Text style={{ color: C.ink, fontWeight: '700' }}>This transaction is on hold.</Text>
                 <Muted>Only continue if you know this person or merchant and nobody is pressuring you to pay.</Muted>
               </Card>
@@ -205,7 +210,7 @@ export default function TransactScreen() {
 
       {step === 'done' && (
         <Card style={{ alignItems: 'center', paddingVertical: 28 }}>
-          <Text style={{ fontSize: 44 }}>✅</Text>
+          <IconBubble name="checkmark" color="#fff" bg={C.success} size={68} />
           <H2>{type === 'topup' ? 'Top up successful' : type === 'bill' ? 'Bill paid' : 'Money sent'}</H2>
           <Text style={{ color: C.ink, fontWeight: '800', fontSize: 28 }}>{peso(amount)}</Text>
           <Muted>
@@ -246,7 +251,9 @@ function OtpStep({ onVerified, onCancel }: { onVerified: () => void; onCancel: (
   // detectScreenSharing() once when the step opens
   useEffect(() => {
     let live = true;
-    detectScreenSharing().then((status) => live && setSharing(status));
+    detectScreenSharing().then((status) => {
+      if (live) setSharing(status);
+    });
     return () => {
       live = false;
     };
@@ -254,12 +261,16 @@ function OtpStep({ onVerified, onCancel }: { onVerified: () => void; onCancel: (
 
   const masked = sharing === 'active';
 
+  const cancel = () => onCancel();
+
   const submit = () => {
-    if (input === otp) return onVerified();
+    if (input === otp) {
+      return onVerified();
+    }
     const n = tries + 1;
     setTries(n);
     setInput('');
-    if (n >= MAX_OTP_TRIES) onCancel();
+    if (n >= MAX_OTP_TRIES) cancel();
     else Alert.alert('Invalid OTP', `${MAX_OTP_TRIES - n} attempt(s) left.`);
   };
 
@@ -268,14 +279,18 @@ function OtpStep({ onVerified, onCancel }: { onVerified: () => void; onCancel: (
   if (masked && !acknowledged) {
     return (
       <Card style={{ backgroundColor: C.dangerBg }}>
-        <Text style={{ fontSize: 36 }}>⚠️</Text>
+        <IconBubble name="warning" color="#fff" bg={C.danger} size={56} />
         <H2>Your screen is being shared</H2>
         <Text style={{ color: C.danger, marginBottom: 8, lineHeight: 20 }}>
           Someone may be watching your screen right now. Scammers ask victims to share their screen on a video call so they can read OTP codes.
         </Text>
         <Text style={{ color: C.danger, fontWeight: '700', marginBottom: 12 }}>CiCo will never ask you to share your screen. Stop sharing before continuing.</Text>
-        <Btn label="Cancel payment" variant="danger" onPress={onCancel} />
-        <Btn label="Continue anyway (fields stay masked)" variant="ghost" onPress={() => setAcknowledged(true)} />
+        <Btn label="Cancel payment" variant="danger" onPress={cancel} />
+        <Btn
+          label="Continue anyway (fields stay masked)"
+          variant="ghost"
+          onPress={() => setAcknowledged(true)}
+        />
       </Card>
     );
   }
@@ -283,7 +298,7 @@ function OtpStep({ onVerified, onCancel }: { onVerified: () => void; onCancel: (
   return (
     <>
       {/* Simulated SMS delivery of the OTP (NFR-04). Masked while screen sharing is active. */}
-      <Card style={{ backgroundColor: '#E6F4F1' }}>
+      <Card style={{ backgroundColor: C.primarySoft }}>
         <Text style={s.label}>SMS from CiCo</Text>
         {masked ? (
           <Pressable onPressIn={() => setReveal(true)} onPressOut={() => setReveal(false)}>
@@ -312,7 +327,7 @@ function OtpStep({ onVerified, onCancel }: { onVerified: () => void; onCancel: (
           textContentType="oneTimeCode"
         />
         <Btn label="Authorize payment" onPress={submit} disabled={input.length !== 6} />
-        <Btn label="Cancel" variant="ghost" onPress={onCancel} />
+        <Btn label="Cancel" variant="ghost" onPress={cancel} />
       </Card>
     </>
   );

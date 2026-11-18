@@ -85,7 +85,18 @@ export type TxDetails = {
   recipientReported: boolean;
   firstTimeRecipient: boolean;
   note?: string;
+  // Counter QR codes: the merchant name printed in the QR vs. who the money actually goes to.
+  qrMerchantClaim?: string;
+  recipientName?: string;
+  recipientIsMerchant?: boolean;
 };
+
+const sameName = (a: string, b: string) => a.replace(/[^a-z0-9]/gi, '').toLowerCase() === b.replace(/[^a-z0-9]/gi, '').toLowerCase();
+
+/** True when a scanned QR claims to be one store but pays a different account. */
+export function isMerchantMismatch(d: Pick<TxDetails, 'qrMerchantClaim' | 'recipientName' | 'recipientIsMerchant'>) {
+  return !!d.qrMerchantClaim && !(d.recipientIsMerchant && d.recipientName && sameName(d.qrMerchantClaim, d.recipientName));
+}
 
 // runRiskAssessment(transactionDetails) – returns a colour-coded result (NFR-03)
 export function runRiskAssessment(d: TxDetails): RiskResult {
@@ -97,11 +108,13 @@ export function runRiskAssessment(d: TxDetails): RiskResult {
   };
 
   if (d.type !== 'topup') {
+    if (d.qrMerchantClaim && d.recipientKnown && isMerchantMismatch(d))
+      raise('red', `Merchant mismatch: this QR says "${d.qrMerchantClaim}" but pays ${d.recipientName}${d.recipientIsMerchant ? '' : ' (a personal account)'}`);
     if (!d.recipientKnown) raise('red', 'Recipient is not a registered CiCo account or biller');
     else if (!d.recipientVerified) raise('yellow', 'Recipient has not completed identity verification');
     if (d.recipientFrozen) raise('red', 'Recipient account is frozen pending a fraud investigation');
     if (d.recipientReported) raise('red', 'Recipient has been reported by other users');
-    if (d.type === 'send' && d.firstTimeRecipient && d.recipientKnown) raise('yellow', 'First time sending to this person');
+    if (d.type === 'send' && d.firstTimeRecipient && d.recipientKnown && !d.recipientIsMerchant) raise('yellow', 'First time sending to this person');
     if (d.balance > 0 && d.amount >= d.balance * 0.8) raise('yellow', 'Amount is most of your balance');
   }
   if (d.amount >= 20000) raise('yellow', 'Large amount (₱20,000 or more)');
@@ -113,7 +126,7 @@ export function runRiskAssessment(d: TxDetails): RiskResult {
 }
 
 export const RISK_COPY: Record<RiskLevel, { label: string; color: string; bg: string }> = {
-  green: { label: 'Low risk', color: '#0E7C4A', bg: '#DDF5E8' },
-  yellow: { label: 'Check details', color: '#8A5A00', bg: '#FFF1CC' },
-  red: { label: 'High risk', color: '#B42318', bg: '#FDE2DF' },
+  green: { label: 'Low risk', color: '#0E9F6E', bg: '#E3F7EF' },
+  yellow: { label: 'Check details', color: '#A15C07', bg: '#FFF4D6' },
+  red: { label: 'High risk', color: '#D92D20', bg: '#FDEBEA' },
 };

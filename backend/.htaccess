@@ -1,0 +1,10 @@
+# Pass the Authorization header through to PHP (Apache drops it otherwise).
+SetEnvIf Authorization "(.+)" HTTP_AUTHORIZATION=$1
+
+Options -Indexes
+DirectoryIndex index.php
+
+# Never serve configuration over HTTP.
+<FilesMatch "^config(\.local)?\.php$">
+    Require all denied
+</FilesMatch>
